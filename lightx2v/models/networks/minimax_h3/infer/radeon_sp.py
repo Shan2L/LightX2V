@@ -7,7 +7,8 @@ into an IPC-shared output, and pull back their rows in chunks overlapped with th
 The rest of the block uses aiter gfx1201 HIP ops (rms_modulate, gated_residual, swiglu).
 Knobs (environment): RADEON_CORESW_SP_O_CHUNKS (3), RADEON_CORESW_SP_PULL_ORDER (1),
 RADEON_CORESW_SP_DOWN_SPLIT (2), RADEON_CORESW_SP_PREFETCH_GATE (core|post|none),
-RADEON_CORESW_SP_FULLGEMM (0, validation only), RADEON_CORESW_RMS_MOD / RADEON_CORESW_SWIGLU (1).
+RADEON_CORESW_SP_FULLGEMM (0, validation only), RADEON_CORESW_RMS_MOD / RADEON_CORESW_SWIGLU (1),
+RADEON_CORESW_INT4 (0) / RADEON_CORESW_INT4_POLICY (lossy INT4 attention, see int4_core).
 """
 
 import os
@@ -21,6 +22,7 @@ from torch.profiler import record_function
 HEAD_DIM = 128
 _exchanges = {}
 _engines = {}
+_int4_policies = {}
 # flag page: one uint32 slot per peer rank in each region; a slot is written only by that peer
 QKV_READY, QKV_PULLED, O_READY, O_PULLED = 0, 256, 512, 768
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -268,9 +270,10 @@ class SdmaEngine:
     def _pulled(self, src, chunk):
         return self.out_pulled.setdefault((src, chunk), torch.cuda.Event())
 
-    def attention(self, inputs, weights, query_weight, key_weight, cosine, sine, project=None):
+    def attention(self, inputs, weights, query_weight, key_weight, cosine, sine, project=None, block=None):
         """project: optional [K, N] out-projection weight view (MMWeight._get_actual_weight()); if given, returns
-        torch.mm(unpacked attention output, project) computed per row chunk, else the unpacked output."""
+        torch.mm(unpacked attention output, project) computed per row chunk, else the unpacked output.
+        block: DiT block index, selects the INT4 core (int4_core)."""
         from aiter.ops.gfx1201.asm_attention import launch_hip_sage_core
         from aiter.ops.gfx1201.norm_rope_prepare import norm_rope_prepare_sage
 
@@ -306,13 +309,24 @@ class SdmaEngine:
         for src in self.order:
             stream.wait_event(self.qkv_pulled[src])
         query, key, value = (self.full[index].view(self.total, self.heads, HEAD_DIM) for index in range(3))
-        prepared = norm_rope_prepare_sage(query, key, value, query_weight, key_weight, cosine, sine)
+        core = int4_core(block)
+        if core is None:
+            prepared = norm_rope_prepare_sage(query, key, value, query_weight, key_weight, cosine, sine)
+        else:
+            from aiter.ops.gfx1201 import int4_attention as int4
+
+            # in place: the full buffers are refilled by the next epoch's pulls
+            int4.qk_norm_rope(query, key, query_weight, key_weight, cosine, sine, query, key)
+            prepared = int4.int4_prepare(query, key, value)
         self.prepared.record(stream)
         for dest in self.order:
             hip.wait_value(stream.cuda_stream, self._mine(O_PULLED, dest), epoch - 1)
         query_int8, query_scale, key_int8, key_scale, value_fp8, value_scale = prepared
         self.core_started.record(stream)
-        launch_hip_sage_core(query_int8, key_int8, value_fp8, query_scale, key_scale, value_scale, self.out, 1, self.padded, self.total, self.heads)
+        if core is None:
+            launch_hip_sage_core(query_int8, key_int8, value_fp8, query_scale, key_scale, value_scale, self.out, 1, self.padded, self.total, self.heads)
+        else:
+            int4.launch_int4_core(core, query_int8, key_int8, value_fp8, query_scale, key_scale, value_scale, self.out, 1, self.padded, self.total, self.heads)
         del prepared
         for dest in self.order:
             hip.write_value(stream.cuda_stream, self._theirs(dest, O_READY), epoch)
@@ -356,6 +370,23 @@ def prefetch_gate():
         return None
     engine = next(iter(_engines.values()))
     return engine.core_started if gate == "core" else engine.unpacked
+
+
+def int4_core(block):
+    """INT4 attention core for DiT block ``block`` (RADEON_CORESW_INT4=1; lossy), or None for the INT8 Sage path.
+    RADEON_CORESW_INT4_POLICY = "<default core>,<block>=<core or int8>,...", cores th4 | t2 | th4f | t2f of
+    aiter.ops.gfx1201.int4_attention; default "th4f,40=t2f,45=int8,49=int8" (blocks 45 and 49 have outlier heads)."""
+    if os.environ.get("RADEON_CORESW_INT4", "0") != "1" or block is None:
+        return None
+    spec = os.environ.get("RADEON_CORESW_INT4_POLICY", "th4f,40=t2f,45=int8,49=int8")
+    if spec not in _int4_policies:
+        default, *rest = spec.split(",")
+        _int4_policies[spec] = (default, {int(b): c for b, c in (item.split("=") for item in rest)})
+        if os.environ.get("RANK", "0") == "0":
+            print(f"[radeon_sp] INT4 attention: default core {default}, per block {_int4_policies[spec][1]}", flush=True)
+    default, per_block = _int4_policies[spec]
+    core = per_block.get(block, default)
+    return None if core == "int8" else core
 
 
 def get_engine(exchange, heads, device):
@@ -412,7 +443,13 @@ def infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
     direct = type(to_out).__name__ == "MMWeight" and not to_out.has_lora_branch and getattr(to_out, "bias", None) is None
     with record_function("radeon_sp.attention"):
         output = get_engine(exchange, heads, normed.device).attention(
-            normed, _projection_weights(attn), query_weight, key_weight, *state.rotary_emb, project=to_out._get_actual_weight() if direct else None
+            normed,
+            _projection_weights(attn),
+            query_weight,
+            key_weight,
+            *state.rotary_emb,
+            project=to_out._get_actual_weight() if direct else None,
+            block=getattr(owner, "block_idx", None),
         )
     del normed
     with record_function("radeon_sp.out_projection_residual"):
