@@ -11,6 +11,7 @@ RADEON_CORESW_SP_FULLGEMM (0, validation only), RADEON_CORESW_RMS_MOD / RADEON_C
 RADEON_CORESW_S2 (0) / RADEON_CORESW_S2_POLICY (two-stage INT8 attention, see s2_core).
 """
 
+import atexit
 import os
 import sys
 from pathlib import Path
@@ -23,6 +24,7 @@ HEAD_DIM = 128
 _exchanges = {}
 _engines = {}
 _s2_policies = {}
+_s2_calls = {}
 # flag page: one uint32 slot per peer rank in each region; a slot is written only by that peer
 QKV_READY, QKV_PULLED, O_READY, O_PULLED = 0, 256, 512, 768
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,10 +40,31 @@ def split_sizes(total, world):
 # the block (tooling/benchmark/sp2_extreme_v1)
 _SP2_GEMM = {(3584, 5376): 106882, (28672, 5376): 107517}
 _hipb = []
+_hg = []
+
+
+def _hipgemm():
+    if os.environ.get("RADEON_CORESW_SP_TUNED_GEMM", "1") != "1":
+        return None
+    if not _hg:
+        try:
+            if os.environ.get("RADEON_CORESW_FP8", "0") != "1":
+                os.environ.setdefault("HIPGEMM_FP8", "0")
+            import hipgemm as hg
+        except ImportError:
+            hg = None
+        _hg.append(hg)
+    return _hg[0]
 
 
 def _mm(inputs, weight, out=None, world=1):
-    """torch.mm(inputs, weight, out=out), with the tuned hipBLASLt solution for SP2 shapes (RADEON_CORESW_SP_TUNED_GEMM)."""
+    """torch.mm(inputs, weight, out=out), with the gfx1201 BF16 GEMM / tuned hipBLASLt solution for SP2 shapes."""
+    hg = _hipgemm() if inputs.dtype == torch.bfloat16 else None
+    if hg is not None:
+        target = torch.empty((inputs.shape[0], weight.shape[1]), device=inputs.device, dtype=inputs.dtype) if out is None else out
+        if hg.mm(inputs, weight, target):
+            return target
+        out = target
     index = _SP2_GEMM.get((weight.shape[1], weight.shape[0])) if world == 2 and inputs.shape[0] >= 16384 else None
     if index is None or os.environ.get("RADEON_CORESW_SP_TUNED_GEMM", "1") != "1" or inputs.dtype != torch.bfloat16:
         return torch.mm(inputs, weight, out=out)
@@ -371,16 +394,22 @@ def s2_core(block):
     """Two-stage INT8 attention core for DiT block ``block`` (RADEON_CORESW_S2=1; lossy), or None for the default path.
     RADEON_CORESW_S2_POLICY = "<default core>,<block>=<core or sage>,...", cores s2_4_4 | s2_4_7 | th4f | t2f of
     aiter.ops.gfx1201.s2_attention; default "s2_4_4,40=t2f"."""
-    if os.environ.get("RADEON_CORESW_S2", "0") != "1" or block is None:
+    s2 = os.environ.get("RADEON_CORESW_S2")
+    if (s2 if s2 is not None else os.environ.get("H3_S2", "0")) != "1" or block is None:
         return None
-    spec = os.environ.get("RADEON_CORESW_S2_POLICY", "s2_4_4,40=t2f")
+    spec = os.environ.get("RADEON_CORESW_S2_POLICY") or os.environ.get("H3_S2_POLICY") or "s2_4_4,40=t2f"
     if spec not in _s2_policies:
         default, *rest = spec.split(",")
-        _s2_policies[spec] = (default, {int(b): c for b, c in (item.split("=") for item in rest)})
+        _s2_policies[spec] = (default, {int(b): c for b, c in (item.split("=") for item in rest if "=" in item)})
         if os.environ.get("RANK", "0") == "0":
             print(f"[radeon_sp] S2 INT8 attention: default core {default}, per block {_s2_policies[spec][1]}", flush=True)
     default, per_block = _s2_policies[spec]
     core = per_block.get(block, default)
+    if not _s2_calls:
+        rank = os.environ.get("RANK", "0")
+        atexit.register(lambda: print(f"[Radeon CoreSW S2] rank {rank} calls {_s2_calls}", flush=True))
+    key = "sage8" if core == "sage" else core
+    _s2_calls[key] = _s2_calls.get(key, 0) + 1
     return None if core == "sage" else core
 
 
@@ -457,11 +486,15 @@ def infer_block(owner, weights, hidden_states, pre_infer_out, modulation):
             from aiter.ops.gfx1201.h3_ops import swiglu
 
             up = weights.ff.in_proj
-            if type(up).__name__ == "MMWeight" and not up.has_lora_branch and getattr(up, "bias", None) is None:
-                up = _mm(normed, up._get_actual_weight(), world=exchange.world)
-            else:
-                up = up.apply(normed)
-            ffn = _down_projection(weights.ff.out_proj, swiglu(up))
+            plain = type(up).__name__ == "MMWeight" and not up.has_lora_branch and getattr(up, "bias", None) is None
+            hg = _hipgemm() if plain else None
+            act = hg.swiglu(up, normed) if hg is not None else None
+            if act is None:
+                act = swiglu(_mm(normed, up._get_actual_weight(), world=exchange.world) if plain else up.apply(normed))
+            del normed
+            ffn = _down_projection(weights.ff.out_proj, act)
+            del act
         else:
             ffn = owner._ff(weights.ff, normed)
+            del normed
         return gated_residual(hidden_states, ffn, gate_mlp, indices)
